@@ -163,6 +163,15 @@ class WANPolicyHead(ActionHead):
         config: WANPolicyHeadConfig,
     ):
         super().__init__()
+        dtype_map = {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "fp32": torch.float32,
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+        }
+        model_dtype = dtype_map.get(config.model_dtype, torch.float32)
         self.tiled = config.tiled
         self.tile_size_height = config.tile_size_height
         self.tile_size_width = config.tile_size_width
@@ -235,6 +244,11 @@ class WANPolicyHead(ActionHead):
         self.cpu_offload = False
 
         self.model = instantiate(config.diffusion_model_cfg)
+        if model_dtype != torch.float32:
+            self.text_encoder.to(dtype=model_dtype)
+            self.image_encoder.to(dtype=model_dtype)
+            self.vae.to(dtype=model_dtype)
+            self.model.to(dtype=model_dtype)
         self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
@@ -276,31 +290,41 @@ class WANPolicyHead(ActionHead):
             if dit_dir is not None:
                 safetensors_path = os.path.join(dit_dir, "diffusion_pytorch_model.safetensors")
                 safetensors_index_path = os.path.join(dit_dir, "diffusion_pytorch_model.safetensors.index.json")
-                state_dict = {}
 
                 if os.path.exists(safetensors_index_path):
-                    # Handle sharded safetensors
+                    # Handle sharded safetensors without keeping every shard in host RAM.
+                    import gc
+
                     print(f"Loading sharded safetensors using index: {safetensors_index_path}")
 
                     with open(safetensors_index_path, 'r') as f:
                         index = json.load(f)
 
-                    # Load each shard
-                    for shard_file in set(index["weight_map"].values()):
+                    unexpected_keys_accum = set()
+                    for shard_file in sorted(set(index["weight_map"].values())):
                         shard_path = os.path.join(dit_dir, shard_file)
                         print(f"Loading shard: {shard_path}")
                         shard_state_dict = load_file(shard_path)
-                        state_dict.update(shard_state_dict)
+                        _, unexpected_keys = self.model.load_state_dict(shard_state_dict, strict=False)
+                        if unexpected_keys:
+                            unexpected_keys_accum.update(unexpected_keys)
+                        del shard_state_dict
+                        gc.collect()
+                    missing_keys = []
+                    unexpected_keys = sorted(unexpected_keys_accum)
 
                 elif os.path.exists(safetensors_path):
                     # Handle single safetensors file
+                    import gc
+
                     print(f"Loading weights from safetensors: {safetensors_path}")
                     state_dict = load_file(safetensors_path)
+                    missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+                    del state_dict
+                    gc.collect()
 
                 else:
                     raise ValueError(f"No safetensors file found at {safetensors_path} or {safetensors_index_path}")
-
-                missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
 
                 if missing_keys:
                     print(f"Missing keys when loading pretrained weights: {missing_keys}")
@@ -519,11 +543,14 @@ class WANPolicyHead(ActionHead):
         crossattn_cache_neg: KVCacheType = []
 
         for _ in range(self.model.num_layers):
+            # The current inference path accepts cross-attention caches for API
+            # compatibility but does not read them. Keep zero-length placeholders
+            # instead of reserving hundreds of MiB per rank.
             crossattn_cache.append(
-                torch.zeros([2, batch_size, 512, num_heads, head_dim], dtype=dtype, device=device),
+                torch.zeros([2, batch_size, 0, num_heads, head_dim], dtype=dtype, device=device),
             )
             crossattn_cache_neg.append(
-                torch.zeros([2, batch_size, 512, num_heads, head_dim], dtype=dtype, device=device),
+                torch.zeros([2, batch_size, 0, num_heads, head_dim], dtype=dtype, device=device),
             )
 
         return crossattn_cache, crossattn_cache_neg
@@ -554,6 +581,21 @@ class WANPolicyHead(ActionHead):
             self.vae.eval()
             self._vae_device_ready = True
 
+    def _ensure_image_encoder_on_device(self, ref_tensor):
+        if not getattr(self, '_image_encoder_device_ready', False):
+            self.image_encoder.to(device=ref_tensor.device, dtype=torch.bfloat16)
+            self.image_encoder.eval()
+            self._image_encoder_device_ready = True
+
+    def _offload_auxiliary_components(self):
+        if not getattr(self, "_offload_auxiliary_components_enabled", False):
+            return
+        self.image_encoder.to(device="cpu", dtype=torch.bfloat16)
+        self.vae.to(device="cpu", dtype=torch.bfloat16)
+        self._image_encoder_device_ready = False
+        self._vae_device_ready = False
+        torch.cuda.empty_cache()
+
     def encode_video(self, input_video, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
         self._ensure_vae_on_device(input_video)
         with torch.no_grad():
@@ -563,6 +605,7 @@ class WANPolicyHead(ActionHead):
     def encode_image(self, image, num_frames, height, width):
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
             batch_size = image.shape[0]
+            self._ensure_image_encoder_on_device(image)
             clip_context = self.image_encoder.encode_image(image)
             image_input = image.transpose(1, 2)
             image_zeros = torch.zeros(batch_size, 3, num_frames-1, height, width, dtype=torch.bfloat16, device=self._device)
@@ -578,6 +621,7 @@ class WANPolicyHead(ActionHead):
             new_image = y[:, :, 0:1]
             # concat: B * (4+16) * (1+(T-1)/4) * H_latent * W_latent
             y = torch.concat([msk, y], dim=1)
+        self._offload_auxiliary_components()
         return clip_context, y, new_image
     
     def prepare_extra_input(self, latents=None):
@@ -899,7 +943,7 @@ class WANPolicyHead(ActionHead):
                 )
                 if kv_cache_metadata["update_kv_cache"]:
                     for block_index, updated_kv_cache in enumerate(updated_kv_caches):
-                        kv_cache[block_index] = updated_kv_cache.clone()
+                        kv_cache[block_index] = updated_kv_cache
             obs_noise_pred = obs_noise_pred.clone()
             if action_noise_pred is not None:
                 action_noise_pred = action_noise_pred.clone()
@@ -1092,12 +1136,14 @@ class WANPolicyHead(ActionHead):
                 first_frame = videos[:, :, 0:1]  # Extract first frame
                 videos = torch.cat([first_frame, videos], dim=2)
            
+            self._ensure_vae_on_device(videos)
             image = self.vae.encode(
                 videos,
                 tiled=self.tiled,
                 tile_size=(self.tile_size_height, self.tile_size_width),
                 tile_stride=(self.tile_stride_height, self.tile_stride_width),
             )
+            self._offload_auxiliary_components()
 
         end_vae_event.record()
 
@@ -1350,18 +1396,29 @@ class WANPolicyHead(ActionHead):
 
     def post_initialize(self):
         # Move models to the cuda device and set the dtype to bfloat16.
-        print("Moving models to the cuda device and setting the dtype to bfloat16.")
+        self._offload_auxiliary_components_enabled = (
+            os.getenv("DREAMZERO_OFFLOAD_AUXILIARY_COMPONENTS", "false").lower()
+            in {"1", "true", "yes", "on"}
+        )
+        print("Moving DiT model to the cuda device and setting the dtype to bfloat16.")
         self.model.to(device=self._device, dtype=torch.bfloat16)
-        self.text_encoder.to(device=self._device, dtype=torch.bfloat16)
-        self.image_encoder.to(device=self._device, dtype=torch.bfloat16)
-        self.vae.to(device=self._device, dtype=torch.bfloat16)
-        import os
+        if self._offload_auxiliary_components_enabled:
+            print("Keeping text encoder, image encoder, and VAE on CPU until needed.")
+            self.text_encoder.to(device="cpu", dtype=torch.bfloat16)
+            self.image_encoder.to(device="cpu", dtype=torch.bfloat16)
+            self.vae.to(device="cpu", dtype=torch.bfloat16)
+            self._image_encoder_device_ready = False
+            self._vae_device_ready = False
+        else:
+            self.text_encoder.to(device=self._device, dtype=torch.bfloat16)
+            self.image_encoder.to(device=self._device, dtype=torch.bfloat16)
+            self.vae.to(device=self._device, dtype=torch.bfloat16)
         ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
         LOAD_TRT_ENGINE = os.getenv("LOAD_TRT_ENGINE", None)
 
         # Torch compile the modules. Skip _forward_blocks: Dynamo with fullgraph can fail on
         # shape variation (e.g. x [1,50,C] vs e [1,200,C]); the block aligns e to x at runtime.
-        if not ENABLE_TENSORRT:
+        if not ENABLE_TENSORRT and not self._offload_auxiliary_components_enabled:
             print("Torch compiling the TextEncoder, ImageEncoder, and VAE modules (Wan _forward_blocks not compiled).")
 
             self.text_encoder.forward = torch.compile(

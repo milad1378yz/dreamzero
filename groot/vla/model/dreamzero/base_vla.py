@@ -243,14 +243,15 @@ class VLA(PreTrainedModel):
         self.validate_inputs(inputs)
         backbone_inputs = self.backbone.prepare_input(inputs)
         action_inputs = self.action_head.prepare_input(inputs)
+        target_device = torch.device(getattr(self.action_head, "_device", self.device))
 
         def to_device_with_maybe_dtype(x):
             # Only cast to self.compute_dtype if the tensor is floating
             if torch.is_floating_point(x):
-                return x.to(self.device, dtype=self.action_head.dtype)
+                return x.to(target_device, dtype=self.action_head.dtype)
             else:
                 # Keep original dtype
-                return x.to(self.device)
+                return x.to(target_device)
 
         backbone_inputs = tree.map_structure(to_device_with_maybe_dtype, backbone_inputs)
         action_inputs = tree.map_structure(to_device_with_maybe_dtype, action_inputs)
@@ -506,31 +507,12 @@ class VLA(PreTrainedModel):
         from safetensors.torch import load_file
         import os
         import json
+        import gc
         print("loading pretrained@@@@@")
         # Check for different checkpoint formats
         safetensors_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
         safetensors_index_path = os.path.join(pretrained_model_name_or_path, "model.safetensors.index.json")
 
-        state_dict = {}
-        if os.path.exists(safetensors_index_path):
-            # Handle sharded safetensors
-            print(f"Loading sharded safetensors using index: {safetensors_index_path}")
-            
-            with open(safetensors_index_path, 'r') as f:
-                index = json.load(f)
-            
-            # Load each shard
-            for shard_file in set(index["weight_map"].values()):
-                shard_path = os.path.join(pretrained_model_name_or_path, shard_file)
-                print(f"Loading shard: {shard_path}")
-                shard_state_dict = load_file(shard_path)
-                state_dict.update(shard_state_dict)
-                
-        elif os.path.exists(safetensors_path):
-            # Handle single safetensors file
-            print(f"Loading weights from safetensors: {safetensors_path}")
-            state_dict.update(load_file(safetensors_path))
-        
         # Load config
         print("loading config@@")
         config_path = os.path.join(pretrained_model_name_or_path, "config.json")
@@ -545,24 +527,65 @@ class VLA(PreTrainedModel):
             if 'defer_lora_injection' in config.action_head_cfg['config']:
                 config.action_head_cfg['config']['defer_lora_injection'] = False
                 print("config.action_head_cfg['config']['defer_lora_injection'] disabled (set to False)")
+            if getattr(config, "torch_dtype", None) == "bfloat16":
+                config.action_head_cfg['config']['model_dtype'] = "bfloat16"
+                print("config.action_head_cfg['config']['model_dtype'] set to bfloat16")
         elif 'defer_lora_injection' in config.action_head_cfg:
             config.action_head_cfg['defer_lora_injection'] = False
             print("config.action_head_cfg['defer_lora_injection'] disabled (set to False)")
+            if getattr(config, "torch_dtype", None) == "bfloat16":
+                config.action_head_cfg['model_dtype'] = "bfloat16"
+                print("config.action_head_cfg['model_dtype'] set to bfloat16")
 
         # Instantiate model
         model = cls(config)
         print("model", model)
-        # Remove .base_layer from keys (e.g., 'action_head.model.base_model.model.blocks.19.self_attn.v.base_layer.bias' -> 'action_head.model.base_model.model.blocks.19.self_attn.v.bias')
-        has_base_layer = any(".base_layer." in key for key in state_dict.keys())
-        if has_base_layer:
-            print("Removing '.base_layer' from state dict keys")
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                new_k = k.replace(".base_layer.", ".")
-                new_state_dict[new_k] = v
-            state_dict = new_state_dict
 
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        unexpected_keys_accum = set()
+        if os.path.exists(safetensors_index_path):
+            # Handle sharded safetensors without keeping every shard in host RAM.
+            print(f"Loading sharded safetensors using index: {safetensors_index_path}")
+            with open(safetensors_index_path, 'r') as f:
+                index = json.load(f)
+
+            for shard_file in sorted(set(index["weight_map"].values())):
+                shard_path = os.path.join(pretrained_model_name_or_path, shard_file)
+                print(f"Loading shard: {shard_path}")
+                shard_state_dict = load_file(shard_path)
+                if any(".base_layer." in key for key in shard_state_dict.keys()):
+                    shard_state_dict = {
+                        k.replace(".base_layer.", "."): v
+                        for k, v in shard_state_dict.items()
+                    }
+                _, unexpected_keys = model.load_state_dict(shard_state_dict, strict=False)
+                if unexpected_keys:
+                    unexpected_keys_accum.update(unexpected_keys)
+                del shard_state_dict
+                gc.collect()
+
+            missing_keys = []
+            unexpected_keys = sorted(unexpected_keys_accum)
+        elif os.path.exists(safetensors_path):
+            # Handle single safetensors file
+            print(f"Loading weights from safetensors: {safetensors_path}")
+            state_dict = load_file(safetensors_path)
+            # Remove .base_layer from keys (e.g., 'action_head.model.base_model.model.blocks.19.self_attn.v.base_layer.bias' -> 'action_head.model.base_model.model.blocks.19.self_attn.v.bias')
+            has_base_layer = any(".base_layer." in key for key in state_dict.keys())
+            if has_base_layer:
+                print("Removing '.base_layer' from state dict keys")
+                state_dict = {
+                    k.replace(".base_layer.", "."): v
+                    for k, v in state_dict.items()
+                }
+
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            del state_dict
+            gc.collect()
+        else:
+            raise FileNotFoundError(
+                f"No weights found at '{pretrained_model_name_or_path}'. "
+                "Expected 'model.safetensors' or 'model.safetensors.index.json'."
+            )
             
         if missing_keys:
             print(f"Missing keys when loading pretrained weights: {missing_keys}")

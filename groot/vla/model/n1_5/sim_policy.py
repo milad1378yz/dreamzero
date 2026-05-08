@@ -1,5 +1,7 @@
 import importlib
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -17,6 +19,101 @@ import time
 
 from groot.vla.data.schema import DatasetMetadata, EmbodimentTag
 from groot.vla.data.transform import ComposedModalityTransform
+
+
+def _release_host_memory() -> None:
+    import gc
+
+    gc.collect()
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _touch_load_file(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(time.time()))
+
+
+def _wait_for_load_file(path: Path, started_at: float, rank: int, timeout: float = 7200.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if path.exists() and path.stat().st_mtime >= started_at:
+            return
+        time.sleep(2)
+    raise TimeoutError(f"Rank {rank} timed out waiting for serialized load file: {path}")
+
+
+def _replace_linear_with_bnb_int8(module: torch.nn.Module, min_numel: int = 4096) -> tuple[int, int]:
+    try:
+        import bitsandbytes as bnb
+    except ImportError as exc:
+        raise ImportError(
+            "bitsandbytes is required for quantization='bitsandbytes-int8'. "
+            "Install it with `pip install bitsandbytes`."
+        ) from exc
+
+    replaced = 0
+    quantized_params = 0
+    for name, child in list(module.named_children()):
+        if isinstance(child, torch.nn.Linear) and child.weight.numel() >= min_numel:
+            quantized = bnb.nn.Linear8bitLt(
+                child.in_features,
+                child.out_features,
+                bias=child.bias is not None,
+                has_fp16_weights=False,
+                threshold=6.0,
+            )
+            quantized.weight = bnb.nn.Int8Params(
+                child.weight.detach().contiguous(),
+                requires_grad=False,
+                has_fp16_weights=False,
+            )
+            if child.bias is not None:
+                quantized.bias = torch.nn.Parameter(
+                    child.bias.detach().contiguous(),
+                    requires_grad=False,
+                )
+            quantized.train(child.training)
+            setattr(module, name, quantized)
+            replaced += 1
+            quantized_params += child.weight.numel()
+            if child.bias is not None:
+                quantized_params += child.bias.numel()
+        else:
+            child_replaced, child_params = _replace_linear_with_bnb_int8(child, min_numel)
+            replaced += child_replaced
+            quantized_params += child_params
+
+    return replaced, quantized_params
+
+
+def _quantize_model_for_inference(model: torch.nn.Module, quantization: str | None) -> None:
+    if quantization is None:
+        quantization = os.getenv("DREAMZERO_QUANTIZATION")
+    if not quantization or quantization.lower() in {"0", "false", "none", "off"}:
+        return
+
+    quantization = quantization.lower()
+    if quantization != "bitsandbytes-int8":
+        raise ValueError(
+            f"Unsupported quantization mode: {quantization}. "
+            "Supported modes: bitsandbytes-int8."
+        )
+
+    action_head = getattr(model, "action_head", None)
+    dit_model = getattr(action_head, "model", None)
+    if dit_model is None:
+        raise ValueError("bitsandbytes-int8 quantization requires model.action_head.model")
+
+    replaced, quantized_params = _replace_linear_with_bnb_int8(dit_model)
+    print(
+        "Applied bitsandbytes int8 quantization to "
+        f"{replaced} DiT Linear layers ({quantized_params:,} parameters)."
+    )
 
 
 class ModelManager:
@@ -235,6 +332,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         skip_img_transform: bool = False,
         lazy_load: bool = False,
         device_mesh: DeviceMesh | None = None,
+        quantization: str | None = None,
     ):
         """
         Initialize the GrootSimPolicy.
@@ -261,6 +359,31 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         # Store model loading parameters for lazy loading
         self.model_config_overrides = model_config_overrides
         self.model_dir = model_dir
+        serialize_model_load = (
+            dist.is_initialized()
+            and dist.get_world_size() > 1
+            and os.getenv("DREAMZERO_SERIALIZE_MODEL_LOAD", "true").lower()
+            not in {"0", "false", "no", "off"}
+        )
+        load_sync_started_at = time.time()
+        load_done_paths: list[Path] = []
+        if serialize_model_load:
+            load_sync_dir = Path(
+                os.getenv(
+                    "DREAMZERO_LOAD_SYNC_DIR",
+                    os.path.join(
+                        tempfile.gettempdir(),
+                        f"dreamzero-load-{os.getenv('MASTER_PORT', 'default')}",
+                    ),
+                )
+            )
+            load_done_paths = [
+                load_sync_dir / f"rank_{rank}.done"
+                for rank in range(dist.get_world_size())
+            ]
+        if serialize_model_load and self.rank != 0:
+            print(f"Rank {self.rank} waiting for rank 0 to finish model load.")
+            _wait_for_load_file(load_done_paths[0], load_sync_started_at, self.rank)
         
         # 1. Load the model
         if (
@@ -332,15 +455,21 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         self.eval_bf16 = self.train_cfg.get("eval_bf16", False)
         if self.eval_bf16 and not lazy_load:
             model = model.to(dtype=torch.bfloat16)
+        _quantize_model_for_inference(model, quantization)
 
         # Store model initially on CPU if lazy loading
         if lazy_load:
             model.to(device='cpu')
+        elif quantization:
+            pass
         else:
             model.to(device=device)
+        _release_host_memory()
 
         # Post initialize, move RoPE freqs to cuda.
         model.post_initialize()
+        if quantization and hasattr(model.action_head, "enable_vram_management"):
+            model.action_head.enable_vram_management()
 
         # Parallelize the model across devices.
         try:
@@ -349,6 +478,16 @@ class GrootSimPolicy(BaseGrootSimPolicy):
             print("Skipping parallelization")
 
         torch.cuda.empty_cache()
+        _release_host_memory()
+        if serialize_model_load:
+            _touch_load_file(load_done_paths[self.rank])
+            if self.rank == 0:
+                print("Rank 0 finished model load; waiting for remaining ranks.")
+            else:
+                print(f"Rank {self.rank} finished serialized model load.")
+            for rank, done_path in enumerate(load_done_paths):
+                if rank != self.rank:
+                    _wait_for_load_file(done_path, load_sync_started_at, self.rank)
 
         self.trained_model = model
 

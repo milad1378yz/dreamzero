@@ -82,7 +82,8 @@ dependencies = [
     "decord2",
     "deepspeed",
     "tiktoken",
-    "sentencepiece"
+    "sentencepiece",
+    "bitsandbytes",
 ]
 
 [project.optional-dependencies]

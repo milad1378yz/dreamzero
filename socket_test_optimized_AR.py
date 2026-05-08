@@ -31,6 +31,33 @@ from eval_utils.policy_server import PolicyServerConfig
 
 logger = logging.getLogger(__name__)
 
+def _apply_max_chunk_size(policy: GrootSimPolicy, max_chunk_size: int | None) -> None:
+    if max_chunk_size is None:
+        return
+
+    dit_model = policy.trained_model.action_head.model
+    local_attn_size = (
+        max_chunk_size * dit_model.num_frame_per_block + 1
+        if max_chunk_size != -1
+        else -1
+    )
+    dit_model.local_attn_size = local_attn_size
+
+    for block in dit_model.blocks:
+        block.local_attn_size = local_attn_size
+        block.self_attn.local_attn_size = local_attn_size
+        block.self_attn.max_attention_size = (
+            21 * dit_model.frame_seqlen
+            if local_attn_size == -1
+            else local_attn_size * dit_model.frame_seqlen
+        )
+
+    logger.info(
+        "Set DiT max_chunk_size=%s, local_attn_size=%s",
+        max_chunk_size,
+        local_attn_size,
+    )
+
 @dataclasses.dataclass
 class Args:
     port: int = 8000
@@ -39,6 +66,8 @@ class Args:
     enable_dit_cache: bool = False
     index: int = 0
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
+    attention_backend: str = "FA2"
+    quantization: str | None = None
 
 
 class ARDroidRoboarenaPolicy:
@@ -83,6 +112,24 @@ class ARDroidRoboarenaPolicy:
         # Create output directory if specified
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
+
+    def _decode_video_latents(self, video_latents: torch.Tensor) -> torch.Tensor:
+        action_head = self._policy.trained_model.action_head
+        if hasattr(action_head, "_ensure_vae_on_device"):
+            action_head._ensure_vae_on_device(video_latents)
+        else:
+            action_head.vae.to(device=video_latents.device, dtype=video_latents.dtype)
+
+        try:
+            return action_head.vae.decode(
+                video_latents,
+                tiled=action_head.tiled,
+                tile_size=(action_head.tile_size_height, action_head.tile_size_width),
+                tile_stride=(action_head.tile_stride_height, action_head.tile_stride_width),
+            )
+        finally:
+            if hasattr(action_head, "_offload_auxiliary_components"):
+                action_head._offload_auxiliary_components()
     
     def _convert_observation(self, obs: dict) -> dict:
         """Convert roboarena observation format to AR_droid format.
@@ -315,12 +362,7 @@ class ARDroidRoboarenaPolicy:
             try:
                 frame_list = []
                 video_across_time_cat = torch.cat(self.video_across_time, dim=2)
-                frames = self._policy.trained_model.action_head.vae.decode(
-                    video_across_time_cat,
-                    tiled=self._policy.trained_model.action_head.tiled,
-                    tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
-                    tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
-                )
+                frames = self._decode_video_latents(video_across_time_cat)
                 frames = rearrange(frames, "B C T H W -> B T H W C")
                 frames = frames[0]
                 frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
@@ -591,12 +633,7 @@ class WebsocketPolicyServer:
                     if len(self.video_across_time) > 10:
                         frame_list = []
                         video_across_time_cat = torch.cat(self.video_across_time, dim=2)
-                        frames = self._policy.trained_model.action_head.vae.decode(
-                            video_across_time_cat,
-                            tiled=self._policy.trained_model.action_head.tiled,
-                            tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
-                            tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
-                        )
+                        frames = self._decode_video_latents(video_across_time_cat)
                         frames = rearrange(frames, "B C T H W -> B T H W C")
                         frames = frames[0]
                         frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
@@ -624,12 +661,7 @@ class WebsocketPolicyServer:
                         print("current_start_frame == 1 + num_frame_per_block and len(self.video_across_time) > 1")
                         frame_list = []
                         video_across_time_cat = torch.cat(self.video_across_time[:-1], dim=2)
-                        frames = self._policy.trained_model.action_head.vae.decode(
-                            video_across_time_cat,
-                            tiled=self._policy.trained_model.action_head.tiled,
-                            tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
-                            tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
-                        )
+                        frames = self._decode_video_latents(video_across_time_cat)
                         frames = rearrange(frames, "B C T H W -> B T H W C")
                         frames = frames[0]
                         frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
@@ -666,12 +698,7 @@ class WebsocketPolicyServer:
                     if len(self.video_across_time) > 0:
                         frame_list = []
                         video_across_time_cat = torch.cat(self.video_across_time, dim=2)
-                        frames = self._policy.trained_model.action_head.vae.decode(
-                            video_across_time_cat,
-                            tiled=self._policy.trained_model.action_head.tiled,
-                            tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
-                            tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
-                        )
+                        frames = self._decode_video_latents(video_across_time_cat)
                         frames = rearrange(frames, "B C T H W -> B T H W C")
                         frames = frames[0]
                         frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
@@ -741,8 +768,9 @@ def main(args: Args) -> None:
     # Set environment variable for DIT cache.
     os.environ["ENABLE_DIT_CACHE"] = "true" if args.enable_dit_cache else "false"
 
-    # Use TE cuDNN backend for attention.
-    os.environ["ATTENTION_BACKEND"] = "TE"
+    os.environ["ATTENTION_BACKEND"] = args.attention_backend
+    if args.quantization:
+        os.environ.setdefault("DREAMZERO_OFFLOAD_AUXILIARY_COMPONENTS", "true")
 
     # Increase the recompile limit to 100 for inference due
     # to autoregressive nature of the model (several possible shapes).
@@ -768,7 +796,9 @@ def main(args: Args) -> None:
         model_path=model_path,
         device="cuda" if torch.cuda.is_available() else "cpu",
         device_mesh=device_mesh,
+        quantization=args.quantization,
     )
+    _apply_max_chunk_size(policy, args.max_chunk_size)
 
     # Create server for all ranks - rank 0 handles websocket, others run worker loop
     hostname = socket.gethostname()
