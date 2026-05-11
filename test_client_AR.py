@@ -185,6 +185,7 @@ def test_ar_droid_policy_server(
     num_chunks: int = 15,
     prompt: str = "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan",
     use_zero_images: bool = False,
+    search_k: int | None = None,
 ):
     """Test the AR_droid policy server with roboarena interface.
 
@@ -219,11 +220,17 @@ def test_ar_droid_policy_server(
     session_id = str(uuid.uuid4())
     logging.info(f"Session ID: {session_id}")
 
+    def _maybe_attach_search_k(obs: dict) -> dict:
+        if search_k is not None:
+            obs["search/k"] = int(search_k)
+        return obs
+
     # ── Zero-image fallback mode ──────────────────────────────────────
     if use_zero_images:
         logging.info("Using ZERO dummy images (legacy mode)")
         for i in range(num_chunks):
             obs = _make_zero_observation(server_config, prompt=prompt, session_id=session_id)
+            _maybe_attach_search_k(obs)
             logging.info(f"Inference {i + 1}/{num_chunks}: prompt='{prompt}'")
             t0 = time.time()
             actions = client.infer(obs)
@@ -253,6 +260,7 @@ def test_ar_droid_policy_server(
     # Step 0: initial single frame
     logging.info("=== Initial: frame [0] ===")
     obs = _make_obs_from_video(camera_frames, [0], prompt, session_id)
+    _maybe_attach_search_k(obs)
     t0 = time.time()
     actions = client.infer(obs)
     dt = time.time() - t0
@@ -262,6 +270,7 @@ def test_ar_droid_policy_server(
     for chunk_idx, frame_indices in enumerate(chunks):
         logging.info(f"=== Chunk {chunk_idx}: frames {frame_indices} ===")
         obs = _make_obs_from_video(camera_frames, frame_indices, prompt, session_id)
+        _maybe_attach_search_k(obs)
         t0 = time.time()
         actions = client.infer(obs)
         dt = time.time() - t0
@@ -310,6 +319,12 @@ def main():
         action="store_true",
         help="Use zero dummy images instead of real video frames (legacy mode)",
     )
+    parser.add_argument(
+        "--search-k",
+        type=int,
+        default=None,
+        help="Override server-side best-of-K via obs['search/k']. Default: use server setting.",
+    )
 
     args = parser.parse_args()
 
@@ -324,6 +339,7 @@ def main():
         num_chunks=args.num_chunks,
         prompt=args.prompt,
         use_zero_images=args.use_zero_images,
+        search_k=args.search_k,
     )
 
 

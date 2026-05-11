@@ -1,10 +1,12 @@
 import dataclasses
+import json
 import logging
 import socket
 import asyncio
 import os
 import http
 import logging
+import sys
 import time
 import traceback
 import torch
@@ -16,6 +18,15 @@ from groot.vla.model.n1_5.sim_policy import GrootSimPolicy
 from groot.vla.data.schema import EmbodimentTag
 import imageio
 import numpy as np
+
+# Make the parent repo importable so we can use wam_search.* without
+# polluting the dreamzero environment with extra deps. wam_search only
+# depends on numpy, which is already required by this file.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from wam_search.executable_reward import executable_action_score  # noqa: E402
 
 from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
@@ -68,6 +79,15 @@ class Args:
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
     attention_backend: str = "FA2"
     quantization: str | None = None
+    # Best-of-K reranking (EVA-style executability score).
+    # K=1 reproduces the original single-forward behavior.
+    search_k: int = 1
+    search_log_path: str | None = None
+    # When True (default), set torch.manual_seed per candidate so the
+    # diffusion sampler produces different rollouts across the K passes.
+    # Seeds are identical across ranks to keep the distributed forward
+    # consistent.
+    search_seed_per_candidate: bool = True
 
 
 class ARDroidRoboarenaPolicy:
@@ -88,11 +108,18 @@ class ARDroidRoboarenaPolicy:
         groot_policy: GrootSimPolicy,
         signal_group: dist.ProcessGroup,
         output_dir: str | None = None,
+        search_k: int = 1,
+        search_log_path: str | None = None,
+        search_seed_per_candidate: bool = True,
     ) -> None:
         self._policy = groot_policy
         self._signal_group = signal_group
         self._output_dir = output_dir
-        
+
+        self._search_k = max(int(search_k), 1)
+        self._search_log_path = search_log_path
+        self._search_seed_per_candidate = bool(search_seed_per_candidate)
+
         # Frame buffers for accumulation (per camera view)
         self._frame_buffers: dict[str, list[np.ndarray]] = {
             "video.exterior_image_1_left": [],
@@ -101,17 +128,19 @@ class ARDroidRoboarenaPolicy:
         }
         self._call_count = 0
         self._is_first_call = True
-        
+
         # Session tracking - reset state when new session starts
         self._current_session_id: str | None = None
-        
+
         # Video across time for saving (similar to original server)
         self.video_across_time = []
         self._msg_index = 0
-        
+
         # Create output directory if specified
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
+        if self._search_log_path:
+            os.makedirs(os.path.dirname(os.path.abspath(self._search_log_path)), exist_ok=True)
 
     def _decode_video_latents(self, video_latents: torch.Tensor) -> torch.Tensor:
         action_head = self._policy.trained_model.action_head
@@ -289,67 +318,140 @@ class ARDroidRoboarenaPolicy:
         data_tensor = torch.frombuffer(serialized, dtype=torch.uint8).cuda()
         dist.broadcast(data_tensor, src=0)
     
+    def _extract_action_array(self, result_batch) -> np.ndarray:
+        """Pull the (N, 8) action array out of the policy result batch."""
+        action_chunk_dict = result_batch.act
+        action_dict = {}
+        for k in dir(action_chunk_dict):
+            if k.startswith("action."):
+                action_dict[k] = getattr(action_chunk_dict, k)
+        return self._convert_action(action_dict)
+
+    def _distributed_forward_once(self, converted_obs: dict, seed: int | None = None):
+        """Run one distributed forward over an already-converted observation.
+
+        All ranks must call into the same forward, so this re-broadcasts the
+        obs (and optional seed) every iteration. The signal broadcast is done
+        once per infer() call by the caller, not here.
+        """
+        # Re-broadcast obs for this candidate.
+        self._broadcast_batch_to_workers(converted_obs)
+
+        # Seed the diffusion sampler so each candidate diverges. Seed is the
+        # same across ranks because tensor-parallel shards need matching noise.
+        if seed is not None:
+            torch.manual_seed(int(seed))
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(int(seed))
+
+        batch = Batch(obs=converted_obs)
+
+        dist.barrier()
+        with torch.no_grad():
+            result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
+        dist.barrier()
+
+        return result_batch, video_pred
+
+    def _log_search_candidates(self, candidates: list[dict], best_idx: int) -> None:
+        if not self._search_log_path:
+            return
+
+        row = {
+            "time": time.time(),
+            "call_count": self._call_count,
+            "msg_index": self._msg_index,
+            "best_idx": int(best_idx),
+            "num_candidates": len(candidates),
+            "candidates": [
+                {
+                    "idx": int(c["idx"]),
+                    "score": float(c["score"]),
+                    "seed": c.get("seed"),
+                    "score_info": c["score_info"],
+                    "action_mean": float(np.mean(c["action"])),
+                    "action_std": float(np.std(c["action"])),
+                    "action_first": c["action"][0].tolist(),
+                    "action_last": c["action"][-1].tolist(),
+                }
+                for c in candidates
+            ],
+        }
+
+        try:
+            with open(self._search_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+        except Exception as e:
+            logger.warning(f"Failed to write search log: {e}")
+
     def infer(self, obs: dict) -> np.ndarray:
-        """Infer actions from observations.
-        
+        """Infer actions from observations with optional best-of-K reranking.
+
+        K is taken from obs["search/k"] if present, otherwise self._search_k.
+
         Args:
             obs: Observation dict in roboarena format
-            
+
         Returns:
-            action: (N, 8) action array
+            action: (N, 8) action array — the highest-scoring candidate.
         """
         # Check for session change - reset state if new session
         session_id = obs.get("session_id", None)
         if session_id is not None and session_id != self._current_session_id:
             if self._current_session_id is not None:
                 logger.info(f"Session changed from '{self._current_session_id}' to '{session_id}', resetting state")
-                # Reset state for new session
                 self._reset_state()
             else:
                 logger.info(f"New session started: '{session_id}'")
             self._current_session_id = session_id
-        
+
         self._msg_index += 1
         self._call_count += 1
-        
-        # Convert observation format
+
+        # Convert observation once; we will reuse it across the K candidates.
         converted_obs = self._convert_observation(obs)
-        
-        # Signal workers to continue (0 = continue)
+
+        # Resolve K (per-request override beats the server-wide default).
+        k_override = obs.get("search/k", None)
+        k = self._search_k if k_override is None else max(int(k_override), 1)
+
+        # Signal workers to continue (0 = continue) — once per infer() call.
         signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
         dist.broadcast(signal_tensor, src=0, group=self._signal_group)
-        
-        # Broadcast obs to workers
-        self._broadcast_batch_to_workers(converted_obs)
-        
-        # Create batch for policy
-        batch = Batch(obs=converted_obs)
-        
-        # Distributed forward pass
-        dist.barrier()
-        with torch.no_grad():
-            result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
-        dist.barrier()
-        
-        # Store video predictions for potential saving
-        self.video_across_time.append(video_pred)
-        
-        # Extract and convert action
-        action_chunk_dict = result_batch.act
-        
-        # Convert Batch to dict
-        action_dict = {}
-        for k in dir(action_chunk_dict):
-            if k.startswith("action."):
-                action_dict[k] = getattr(action_chunk_dict, k)
-        
-        action = self._convert_action(action_dict)
-        
-        # Update first call flag
+
+        # Broadcast (K, base_seed) so workers know how many forwards to run
+        # and which seed to use. base_seed varies per call to keep diversity
+        # between successive infer() invocations as well.
+        base_seed = (int(time.time() * 1000) ^ (self._call_count * 1315423911)) & 0x7FFFFFFF
+        kseed_tensor = torch.tensor([int(k), int(base_seed)], dtype=torch.int64, device='cpu')
+        dist.broadcast(kseed_tensor, src=0, group=self._signal_group)
+
+        candidates: list[dict] = []
+        for i in range(k):
+            seed = (base_seed + i) if (self._search_seed_per_candidate and k > 1) else None
+            result_batch, video_pred = self._distributed_forward_once(converted_obs, seed=seed)
+            action = self._extract_action_array(result_batch)
+            score, score_info = executable_action_score(action)
+            candidates.append({
+                "idx": i,
+                "seed": seed,
+                "score": score,
+                "score_info": score_info,
+                "action": action,
+                "video_pred": video_pred,
+            })
+
+        best = max(candidates, key=lambda c: c["score"])
+
+        # Only keep the winning rollout's video for downstream saving.
+        self.video_across_time.append(best["video_pred"])
+
+        self._log_search_candidates(candidates, best["idx"])
+
         if self._is_first_call:
             self._is_first_call = False
-        
-        return action
+
+        return best["action"]
     
     def _reset_state(self, save_video: bool = True) -> None:
         """Internal method to reset policy state.
@@ -517,15 +619,17 @@ class WebsocketPolicyServer:
             await self._worker_loop()
 
     async def _worker_loop(self):
-        """Worker loop for non-rank-0 processes to participate in distributed inference."""
+        """Worker loop for non-rank-0 processes to participate in distributed inference.
+
+        Per signal from rank 0, this worker receives a (K, base_seed) header and
+        then participates in K forward passes — one per best-of-K candidate.
+        K=1 reproduces the original single-forward behavior.
+        """
         logger.info(f"Worker loop started for rank {dist.get_rank()}")
         signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
+        kseed_tensor = torch.zeros(2, dtype=torch.int64, device='cpu')
         while True:
             try:
-                # Wait for obs broadcast from rank 0
-                # Create a dummy obs dict structure - will be filled by broadcast
-                # obs = {}
-
                 dist.broadcast(signal_tensor, src=0, group=self._signal_group)
 
                 signal = signal_tensor.item()
@@ -533,20 +637,28 @@ class WebsocketPolicyServer:
                     logger.info(f"Rank {dist.get_rank()} received shutdown signal")
                     break
 
-                # --- ADD THIS ELIF BLOCK ---
                 elif signal == 2:
                     logger.info(f"Rank {dist.get_rank()} received idle signal. Waiting for next client.")
-                    # Loop back to the top and wait for the next signal
                     continue
 
-                # Receive the batch data via broadcast/gather mechanism
-                # This is a simplified version - the actual obs structure needs to be broadcasted
-                batch = self._receive_batch_from_rank0()
-                # Participate in distributed forward pass
-                dist.barrier()
-                with torch.no_grad():
-                    result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
-                dist.barrier()
+                # Receive (K, base_seed) for this infer() call.
+                dist.broadcast(kseed_tensor, src=0, group=self._signal_group)
+                k = int(kseed_tensor[0].item())
+                base_seed = int(kseed_tensor[1].item())
+                if k < 1:
+                    k = 1
+
+                for i in range(k):
+                    batch = self._receive_batch_from_rank0()
+                    if k > 1:
+                        seed = base_seed + i
+                        torch.manual_seed(seed)
+                        if torch.cuda.is_available():
+                            torch.cuda.manual_seed_all(seed)
+                    dist.barrier()
+                    with torch.no_grad():
+                        result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
+                    dist.barrier()
 
             except Exception as e:
                 logger.error(f"Worker loop error on rank {dist.get_rank()}: {e}")
@@ -823,6 +935,9 @@ def main(args: Args) -> None:
         groot_policy=policy,
         signal_group=signal_group,
         output_dir=output_dir,
+        search_k=args.search_k,
+        search_log_path=args.search_log_path,
+        search_seed_per_candidate=args.search_seed_per_candidate,
     )
     
     # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)
