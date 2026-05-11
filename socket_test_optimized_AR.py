@@ -318,6 +318,43 @@ class ARDroidRoboarenaPolicy:
         data_tensor = torch.frombuffer(serialized, dtype=torch.uint8).cuda()
         dist.broadcast(data_tensor, src=0)
     
+    def _snapshot_action_head_state(self) -> dict | None:
+        """Clone the action head's mutable AR state so K candidates can fork
+        from the same point. Returns None if the head is missing the expected
+        attributes (best-effort; we fall back to the original drift behavior).
+
+        Snapshots `current_start_frame` and the two KV-cache lists. The
+        crossattn caches are zero-length placeholders and are never written,
+        so they don't need snapshotting.
+        """
+        try:
+            head = self._policy.trained_model.action_head
+        except AttributeError:
+            return None
+        snap = {"current_start_frame": int(getattr(head, "current_start_frame", 0))}
+        for name in ("kv_cache1", "kv_cache_neg"):
+            cache = getattr(head, name, None)
+            if cache is None:
+                snap[name] = None
+            else:
+                snap[name] = [t.clone() for t in cache]
+        return snap
+
+    def _restore_action_head_state(self, snap: dict | None) -> None:
+        if snap is None:
+            return
+        try:
+            head = self._policy.trained_model.action_head
+        except AttributeError:
+            return
+        head.current_start_frame = snap["current_start_frame"]
+        for name in ("kv_cache1", "kv_cache_neg"):
+            cached = snap.get(name)
+            if cached is None:
+                setattr(head, name, None)
+            else:
+                setattr(head, name, [t.clone() for t in cached])
+
     def _extract_action_array(self, result_batch) -> np.ndarray:
         """Pull the (N, 8) action array out of the policy result batch."""
         action_chunk_dict = result_batch.act
@@ -333,13 +370,19 @@ class ARDroidRoboarenaPolicy:
         All ranks must call into the same forward, so this re-broadcasts the
         obs (and optional seed) every iteration. The signal broadcast is done
         once per infer() call by the caller, not here.
+
+        DreamZero's action head hardcodes self.seed=1140, which is passed into
+        `torch.Generator().manual_seed(...)` for diffusion noise. To get
+        different rollouts per candidate we override that attribute directly
+        (mirroring the same override in the worker loop so all ranks sample
+        identical noise).
         """
         # Re-broadcast obs for this candidate.
         self._broadcast_batch_to_workers(converted_obs)
 
-        # Seed the diffusion sampler so each candidate diverges. Seed is the
-        # same across ranks because tensor-parallel shards need matching noise.
         if seed is not None:
+            action_head = self._policy.trained_model.action_head
+            action_head.seed = int(seed)
             torch.manual_seed(int(seed))
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(int(seed))
@@ -426,8 +469,15 @@ class ARDroidRoboarenaPolicy:
         kseed_tensor = torch.tensor([int(k), int(base_seed)], dtype=torch.int64, device='cpu')
         dist.broadcast(kseed_tensor, src=0, group=self._signal_group)
 
+        # Snapshot AR state so every candidate forks from the same point
+        # rather than chaining off the previous one's KV-cache mutations.
+        # Snapshot only when K > 1; the single-candidate path is unchanged.
+        snap = self._snapshot_action_head_state() if k > 1 else None
+
         candidates: list[dict] = []
         for i in range(k):
+            if k > 1 and i > 0:
+                self._restore_action_head_state(snap)
             seed = (base_seed + i) if (self._search_seed_per_candidate and k > 1) else None
             result_batch, video_pred = self._distributed_forward_once(converted_obs, seed=seed)
             action = self._extract_action_array(result_batch)
@@ -440,6 +490,10 @@ class ARDroidRoboarenaPolicy:
                 "action": action,
                 "video_pred": video_pred,
             })
+
+        # After picking the winner, drop the snapshot tensors so they don't
+        # linger as a memory ceiling across infer calls.
+        snap = None
 
         best = max(candidates, key=lambda c: c["score"])
 
@@ -648,10 +702,50 @@ class WebsocketPolicyServer:
                 if k < 1:
                     k = 1
 
+                # Snapshot the action head's AR state on this rank so every
+                # candidate forks from the same KV cache. Same logic that the
+                # rank-0 wrapper runs in ARDroidRoboarenaPolicy.
+                worker_snap = None
+                if k > 1:
+                    try:
+                        head = self._policy.trained_model.action_head
+                        worker_snap = {
+                            "current_start_frame": int(getattr(head, "current_start_frame", 0)),
+                            "kv_cache1": (
+                                [t.clone() for t in head.kv_cache1]
+                                if getattr(head, "kv_cache1", None) is not None else None
+                            ),
+                            "kv_cache_neg": (
+                                [t.clone() for t in head.kv_cache_neg]
+                                if getattr(head, "kv_cache_neg", None) is not None else None
+                            ),
+                        }
+                    except AttributeError:
+                        worker_snap = None
+
                 for i in range(k):
+                    if k > 1 and i > 0 and worker_snap is not None:
+                        try:
+                            head = self._policy.trained_model.action_head
+                            head.current_start_frame = worker_snap["current_start_frame"]
+                            if worker_snap["kv_cache1"] is None:
+                                head.kv_cache1 = None
+                            else:
+                                head.kv_cache1 = [t.clone() for t in worker_snap["kv_cache1"]]
+                            if worker_snap["kv_cache_neg"] is None:
+                                head.kv_cache_neg = None
+                            else:
+                                head.kv_cache_neg = [t.clone() for t in worker_snap["kv_cache_neg"]]
+                        except AttributeError:
+                            pass
+
                     batch = self._receive_batch_from_rank0()
                     if k > 1:
                         seed = base_seed + i
+                        try:
+                            self._policy.trained_model.action_head.seed = int(seed)
+                        except AttributeError:
+                            pass
                         torch.manual_seed(seed)
                         if torch.cuda.is_available():
                             torch.cuda.manual_seed_all(seed)
@@ -659,6 +753,8 @@ class WebsocketPolicyServer:
                     with torch.no_grad():
                         result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
                     dist.barrier()
+
+                worker_snap = None
 
             except Exception as e:
                 logger.error(f"Worker loop error on rank {dist.get_rank()}: {e}")
