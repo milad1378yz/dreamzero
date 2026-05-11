@@ -134,6 +134,9 @@ class ARDroidRoboarenaPolicy:
 
         # Video across time for saving (similar to original server)
         self.video_across_time = []
+        # Mirror list for the *worst*-scoring candidate at each infer() call
+        # when K > 1; used to render a side-by-side comparison video on reset.
+        self._worst_video_across_time = []
         self._msg_index = 0
 
         # Create output directory if specified
@@ -323,9 +326,10 @@ class ARDroidRoboarenaPolicy:
         from the same point. Returns None if the head is missing the expected
         attributes (best-effort; we fall back to the original drift behavior).
 
-        Snapshots `current_start_frame` and the two KV-cache lists. The
-        crossattn caches are zero-length placeholders and are never written,
-        so they don't need snapshotting.
+        Snapshots `current_start_frame` and the two KV-cache lists. Tensors
+        are moved to CPU so the snapshot doesn't double GPU KV-cache memory
+        during best-of-K — we pay a small PCIe cost per candidate restore in
+        exchange for fitting on tight VRAM (e.g. 24 GB 4090s).
         """
         try:
             head = self._policy.trained_model.action_head
@@ -337,7 +341,9 @@ class ARDroidRoboarenaPolicy:
             if cache is None:
                 snap[name] = None
             else:
-                snap[name] = [t.clone() for t in cache]
+                # .to("cpu") on a CUDA tensor returns a CPU copy; pin to speed
+                # up subsequent .cuda() restores.
+                snap[name] = [t.detach().to("cpu", copy=True).pin_memory() for t in cache]
         return snap
 
     def _restore_action_head_state(self, snap: dict | None) -> None:
@@ -353,7 +359,12 @@ class ARDroidRoboarenaPolicy:
             if cached is None:
                 setattr(head, name, None)
             else:
-                setattr(head, name, [t.clone() for t in cached])
+                # Move CPU-resident snapshots back to GPU for the next forward.
+                setattr(
+                    head,
+                    name,
+                    [t.to("cuda", non_blocking=True) for t in cached],
+                )
 
     def _extract_action_array(self, result_batch) -> np.ndarray:
         """Pull the (N, 8) action array out of the policy result batch."""
@@ -500,6 +511,13 @@ class ARDroidRoboarenaPolicy:
         # Only keep the winning rollout's video for downstream saving.
         self.video_across_time.append(best["video_pred"])
 
+        # When K > 1, also keep the *worst* rollout so we can render a
+        # best-vs-worst comparison video at reset. With K = 1 there is
+        # nothing to compare against, so leave the worst list empty.
+        if len(candidates) > 1:
+            worst = min(candidates, key=lambda c: c["score"])
+            self._worst_video_across_time.append(worst["video_pred"])
+
         self._log_search_candidates(candidates, best["idx"])
 
         if self._is_first_call:
@@ -507,46 +525,58 @@ class ARDroidRoboarenaPolicy:
 
         return best["action"]
     
+    def _save_video_list(self, video_list: list, tag: str) -> str | None:
+        """Decode a list of video-pred latents and write a single MP4.
+
+        Returns the output path, or None on failure / no-op.
+        """
+        if not video_list or not self._output_dir:
+            return None
+        try:
+            video_cat = torch.cat(video_list, dim=2)
+            frames = self._decode_video_latents(video_cat)
+            frames = rearrange(frames, "B C T H W -> B T H W C")
+            frames = frames[0]
+            frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+            frame_list = [f for f in frames]
+            if not frame_list:
+                return None
+            sample = frame_list[0]
+            if not (len(sample.shape) == 3 and sample.shape[2] in [1, 3, 4]):
+                return None
+            os.makedirs(self._output_dir, exist_ok=True)
+            existing = [f for f in os.listdir(self._output_dir) if f.endswith(".mp4")]
+            timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
+            n = (len(frame_list) - 1) // 8
+            output_path = os.path.join(
+                self._output_dir,
+                f"{len(existing):06}_{timestamp}_n{n}_{tag}.mp4",
+            )
+            imageio.mimsave(output_path, frame_list, fps=5, codec="libx264")
+            logger.info(f"Saved {tag} video to: {output_path}")
+            return output_path
+        except Exception as e:
+            logger.warning(f"Failed to save {tag} video: {e}")
+            return None
+
     def _reset_state(self, save_video: bool = True) -> None:
         """Internal method to reset policy state.
-        
+
         Args:
             save_video: Whether to save accumulated video before reset.
         """
-        # Optionally save accumulated video before reset
-        if save_video and len(self.video_across_time) > 0 and self._output_dir:
-            try:
-                frame_list = []
-                video_across_time_cat = torch.cat(self.video_across_time, dim=2)
-                frames = self._decode_video_latents(video_across_time_cat)
-                frames = rearrange(frames, "B C T H W -> B T H W C")
-                frames = frames[0]
-                frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
-                for frame in frames:
-                    frame_list.append(frame)
-                
-                if len(frame_list) > 0:
-                    sample_frame = frame_list[0]
-                    if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]:
-                        save_dir = self._output_dir
-                        os.makedirs(save_dir, exist_ok=True)
-                        all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
-                        timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
-                        num_frames = len(frame_list)
-                        n = (num_frames - 1) // 8
-                        output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_n{n}.mp4')
-                        imageio.mimsave(output_path, frame_list, fps=5, codec='libx264')
-                        logger.info(f"Saved video on reset to: {output_path}")
-            except Exception as e:
-                logger.warning(f"Failed to save video on reset: {e}")
-        
+        if save_video:
+            self._save_video_list(self.video_across_time, "best")
+            self._save_video_list(self._worst_video_across_time, "worst")
+
         # Clear frame buffers
         for key in self._frame_buffers:
             self._frame_buffers[key] = []
-        
+
         self._call_count = 0
         self._is_first_call = True
         self.video_across_time = []
+        self._worst_video_across_time = []
     
     def reset(self, reset_info: dict) -> None:
         """Reset the policy state for a new episode.
@@ -704,7 +734,8 @@ class WebsocketPolicyServer:
 
                 # Snapshot the action head's AR state on this rank so every
                 # candidate forks from the same KV cache. Same logic that the
-                # rank-0 wrapper runs in ARDroidRoboarenaPolicy.
+                # rank-0 wrapper runs in ARDroidRoboarenaPolicy. Snapshots
+                # live on CPU to save GPU memory during best-of-K.
                 worker_snap = None
                 if k > 1:
                     try:
@@ -712,11 +743,11 @@ class WebsocketPolicyServer:
                         worker_snap = {
                             "current_start_frame": int(getattr(head, "current_start_frame", 0)),
                             "kv_cache1": (
-                                [t.clone() for t in head.kv_cache1]
+                                [t.detach().to("cpu", copy=True).pin_memory() for t in head.kv_cache1]
                                 if getattr(head, "kv_cache1", None) is not None else None
                             ),
                             "kv_cache_neg": (
-                                [t.clone() for t in head.kv_cache_neg]
+                                [t.detach().to("cpu", copy=True).pin_memory() for t in head.kv_cache_neg]
                                 if getattr(head, "kv_cache_neg", None) is not None else None
                             ),
                         }
@@ -731,11 +762,11 @@ class WebsocketPolicyServer:
                             if worker_snap["kv_cache1"] is None:
                                 head.kv_cache1 = None
                             else:
-                                head.kv_cache1 = [t.clone() for t in worker_snap["kv_cache1"]]
+                                head.kv_cache1 = [t.to("cuda", non_blocking=True) for t in worker_snap["kv_cache1"]]
                             if worker_snap["kv_cache_neg"] is None:
                                 head.kv_cache_neg = None
                             else:
-                                head.kv_cache_neg = [t.clone() for t in worker_snap["kv_cache_neg"]]
+                                head.kv_cache_neg = [t.to("cuda", non_blocking=True) for t in worker_snap["kv_cache_neg"]]
                         except AttributeError:
                             pass
 
