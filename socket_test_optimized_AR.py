@@ -227,16 +227,26 @@ class ARDroidRoboarenaPolicy:
     def _video_pred_to_idm_frames(self, video_pred: torch.Tensor) -> np.ndarray:
         """Convert DreamZero predicted video latents to IDM input frames.
 
-        Returns ``(n_cams, T, 3, H, W)`` uint8 already resized to the IDM's
-        ``image_size``.
+        DreamZero's data pipeline tile-stitches multiple cameras into a single
+        2×2 canvas before encoding (see ``groot.vla.model.dreamzero.transform.
+        dreamzero_cotrain._prepare_video``). So the decoded video has the
+        cameras laid out spatially:
 
-        NOTE: the cam-axis layout of DreamZero's multi-cam latents differs
-        between embodiments. For LIBERO-90 the LoRA was trained on 2 cams
-        (agentview + wrist). This helper currently assumes the decoded tensor
-        shape is ``(B, C, T, H, W)`` with B == n_cams (cams batched). If your
-        LoRA stacks cams differently (channel-concat, tile-stitch, ...), adjust
-        the reshape below — and run prm.reward.PRMReward on a sanity batch
-        before trusting the K-rerank numbers.
+            ┌──────────────────┬──────────────────┐
+            │ view 0  (TL)     │ view 2  (TR)     │
+            ├──────────────────┼──────────────────┤
+            │ view 1  (BL)     │ black   (BR)     │
+            └──────────────────┴──────────────────┘
+
+        For LIBERO-90 the LoRA was trained on 2 cams: view 0 = ``video.image``
+        (agentview), view 1 = ``video.wrist_image``. So we extract TL + BL.
+
+        Returns ``(n_cams, T, 3, H, W)`` uint8 resized to the IDM's
+        ``image_size``. The aspect-ratio rescale from the (h, 2w → 1:2) tile to
+        the IDM's square input is a known minor distortion; the IDM was trained
+        on LIBERO's native 128×128 frames and should generalize, but if the
+        consistency reward looks degenerate at inference, retrain the IDM at
+        the LoRA's tile aspect ratio.
         """
         from prm.reward import prepare_video_frames_for_idm
 
@@ -244,17 +254,32 @@ class ARDroidRoboarenaPolicy:
         decoded = rearrange(decoded, "B C T H W -> B T H W C")
         decoded = ((decoded.float() + 1) * 127.5).clamp(0, 255).to(torch.uint8).cpu().numpy()
 
-        n_cams = self._prm_reward.cfg.n_cams
-        if decoded.shape[0] < n_cams:
+        if decoded.shape[0] != 1:
             raise ValueError(
-                f"decoded video has {decoded.shape[0]} cams along batch axis; "
-                f"PRM expects {n_cams}. Inspect the multi-cam layout of your "
-                f"LoRA's video output and update _video_pred_to_idm_frames."
+                f"expected B=1 in decoded video (tile-stitched), got {decoded.shape[0]}"
             )
-        decoded = decoded[:n_cams]  # (n_cams, T, H, W, 3)
+        canvas = decoded[0]  # (T, 2h, 2w, 3)
+        t_full, h2, w2, _ = canvas.shape
+        h = h2 // 2
+        w = w2 // 2
+
+        n_cams = self._prm_reward.cfg.n_cams
+        if n_cams == 1:
+            cams = canvas[None, :, :h, :w, :]  # agentview only
+        elif n_cams == 2:
+            agent = canvas[:, :h, :w, :]       # top-left
+            wrist = canvas[:, h:, :w, :]       # bottom-left
+            cams = np.stack([agent, wrist], axis=0)  # (2, T, h, w, 3)
+        elif n_cams == 3:
+            agent = canvas[:, :h, :w, :]
+            wrist = canvas[:, h:, :w, :]
+            third = canvas[:, :h, w:, :]
+            cams = np.stack([agent, wrist, third], axis=0)
+        else:
+            raise ValueError(f"n_cams={n_cams} not supported by 2x2 tile extractor")
 
         return prepare_video_frames_for_idm(
-            decoded,
+            cams,
             n_cams=n_cams,
             video_len=self._prm_reward.cfg.video_len,
             image_size=self._prm_reward.cfg.target_image_size,
