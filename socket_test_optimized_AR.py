@@ -103,6 +103,11 @@ class Args:
     prm_lambda_exec: float = 1.0
     prm_lambda_cons: float = 1.0
 
+    # Embodiment selection. "oxe_droid" preserves the original DROID-only
+    # behavior. "libero" switches camera key remapping, frame buffers, and
+    # PolicyServerConfig to the 2-cam (agentview + wrist) LIBERO layout.
+    embodiment_tag: str = "oxe_droid"
+
 
 class ARDroidRoboarenaPolicy:
     """Wrapper policy that implements roboarena.policy.BasePolicy interface for AR_droid.
@@ -128,6 +133,7 @@ class ARDroidRoboarenaPolicy:
         prm_idm_ckpt: str | None = None,
         prm_lambda_exec: float = 1.0,
         prm_lambda_cons: float = 1.0,
+        embodiment_tag: str = "oxe_droid",
     ) -> None:
         self._policy = groot_policy
         self._signal_group = signal_group
@@ -136,6 +142,7 @@ class ARDroidRoboarenaPolicy:
         self._search_k = max(int(search_k), 1)
         self._search_log_path = search_log_path
         self._search_seed_per_candidate = bool(search_seed_per_candidate)
+        self._embodiment_tag = embodiment_tag
 
         self._prm_reward = None
         if prm_idm_ckpt:
@@ -162,11 +169,23 @@ class ARDroidRoboarenaPolicy:
                     )
                     self._prm_reward = None
 
-        # Frame buffers for accumulation (per camera view)
+        # Embodiment-specific camera key remapping. The websocket protocol
+        # sends roboarena-style keys ("observation/exterior_image_*", etc.);
+        # the DreamZero data pipeline expects modality-prefixed keys whose
+        # exact names differ per embodiment (DROID = 3 cams, LIBERO = 2 cams).
+        if self._embodiment_tag == "libero":
+            self._image_key_mapping: dict[str, str] = {
+                "observation/exterior_image_0_left": "video.image",
+                "observation/wrist_image_left": "video.wrist_image",
+            }
+        else:
+            self._image_key_mapping = {
+                "observation/exterior_image_0_left": "video.exterior_image_1_left",
+                "observation/exterior_image_1_left": "video.exterior_image_2_left",
+                "observation/wrist_image_left": "video.wrist_image_left",
+            }
         self._frame_buffers: dict[str, list[np.ndarray]] = {
-            "video.exterior_image_1_left": [],
-            "video.exterior_image_2_left": [],
-            "video.wrist_image_left": [],
+            droid_key: [] for droid_key in self._image_key_mapping.values()
         }
         self._call_count = 0
         self._is_first_call = True
@@ -306,13 +325,9 @@ class ARDroidRoboarenaPolicy:
         """
         converted = {}
         
-        # Map image keys (roboarena uses 0-indexed, AR_droid uses 1-indexed)
-        image_key_mapping = {
-            "observation/exterior_image_0_left": "video.exterior_image_1_left",
-            "observation/exterior_image_1_left": "video.exterior_image_2_left",
-            "observation/wrist_image_left": "video.wrist_image_left",
-        }
-        
+        # Embodiment-specific image key remapping was built in __init__.
+        image_key_mapping = self._image_key_mapping
+
         # Accumulate frames for each camera view
         for roboarena_key, droid_key in image_key_mapping.items():
             if roboarena_key in obs:
@@ -1137,7 +1152,7 @@ def main(args: Args) -> None:
     # to autoregressive nature of the model (several possible shapes).
     torch._dynamo.config.recompile_limit = 800
 
-    embodiment_tag = "oxe_droid"
+    embodiment_tag = args.embodiment_tag
     model_path = args.model_path
     policy_metadata = {
         "embodiment": embodiment_tag,
@@ -1190,17 +1205,29 @@ def main(args: Args) -> None:
         prm_idm_ckpt=args.prm_idm_ckpt,
         prm_lambda_exec=args.prm_lambda_exec,
         prm_lambda_cons=args.prm_lambda_cons,
+        embodiment_tag=embodiment_tag,
     )
-    
-    # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)
-    server_config = PolicyServerConfig(
-        image_resolution=(180, 320),  # AR_droid expects 180x320 images
-        needs_wrist_camera=True,
-        n_external_cameras=2,
-        needs_stereo_camera=False,
-        needs_session_id=True,  # Track session to reset state for new clients
-        action_space="joint_position",
-    )
+
+    if embodiment_tag == "libero":
+        # LIBERO: agentview + wrist (2 cams), 320x176 frames per the LoRA conf.
+        server_config = PolicyServerConfig(
+            image_resolution=(176, 320),
+            needs_wrist_camera=True,
+            n_external_cameras=1,
+            needs_stereo_camera=False,
+            needs_session_id=True,
+            action_space="joint_position",
+        )
+    else:
+        # AR_droid: 2 external cameras + wrist (3 cams), 180x320 frames.
+        server_config = PolicyServerConfig(
+            image_resolution=(180, 320),
+            needs_wrist_camera=True,
+            n_external_cameras=2,
+            needs_stereo_camera=False,
+            needs_session_id=True,
+            action_space="joint_position",
+        )
     
     if rank == 0:
         logging.info("Using roboarena policy server interface")
