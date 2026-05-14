@@ -108,6 +108,13 @@ class Args:
     # PolicyServerConfig to the 2-cam (agentview + wrist) LIBERO layout.
     embodiment_tag: str = "oxe_droid"
 
+    # Optional base model to merge into the policy AFTER GrootSimPolicy's LoRA
+    # load, BEFORE re-applying the LoRA. Needed when running the LIBERO LoRA,
+    # because its checkpoint only contains LoRA deltas + a handful of MLPs —
+    # the action_head image encoder and other DreamZero-trained weights have
+    # to come from DreamZero-AgiBot. Without this flag rollouts will be noise.
+    base_model_path: str | None = None
+
 
 class ARDroidRoboarenaPolicy:
     """Wrapper policy that implements roboarena.policy.BasePolicy interface for AR_droid.
@@ -1175,6 +1182,15 @@ def main(args: Args) -> None:
         quantization=args.quantization,
     )
     _apply_max_chunk_size(policy, args.max_chunk_size)
+
+    if args.base_model_path is not None:
+        # Merge AgiBot weights into the policy and re-apply the LoRA.
+        # See prm/lora_with_base.py for why this is required when running
+        # the LIBERO LoRA (the released checkpoint only contains LoRA deltas
+        # + a handful of MLPs; the action-head image encoder etc. come from
+        # AgiBot).
+        from prm.lora_with_base import merge_base_into_policy
+        merge_base_into_policy(policy, args.base_model_path, model_path)
 
     # Create server for all ranks - rank 0 handles websocket, others run worker loop
     hostname = socket.gethostname()
