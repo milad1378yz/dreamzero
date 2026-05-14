@@ -28,6 +28,12 @@ if _REPO_ROOT not in sys.path:
 
 from wam_search.executable_reward import executable_action_score  # noqa: E402
 
+try:
+    from prm.reward import PRMReward, PRMRewardConfig  # noqa: E402
+except Exception:  # pragma: no cover - prm package optional at import time
+    PRMReward = None  # type: ignore[assignment]
+    PRMRewardConfig = None  # type: ignore[assignment]
+
 from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
 import websockets.asyncio.server as _server
@@ -89,6 +95,14 @@ class Args:
     # consistent.
     search_seed_per_candidate: bool = True
 
+    # PRM (learned IDM-based) reward. If prm_idm_ckpt is set, the K-candidate
+    # reranker decodes each candidate's predicted video, runs the IDM, and
+    # scores with R_exec + lambda_cons * R_cons in place of the heuristic
+    # executable_action_score. Falls back to the heuristic on any error.
+    prm_idm_ckpt: str | None = None
+    prm_lambda_exec: float = 1.0
+    prm_lambda_cons: float = 1.0
+
 
 class ARDroidRoboarenaPolicy:
     """Wrapper policy that implements roboarena.policy.BasePolicy interface for AR_droid.
@@ -111,6 +125,9 @@ class ARDroidRoboarenaPolicy:
         search_k: int = 1,
         search_log_path: str | None = None,
         search_seed_per_candidate: bool = True,
+        prm_idm_ckpt: str | None = None,
+        prm_lambda_exec: float = 1.0,
+        prm_lambda_cons: float = 1.0,
     ) -> None:
         self._policy = groot_policy
         self._signal_group = signal_group
@@ -119,6 +136,31 @@ class ARDroidRoboarenaPolicy:
         self._search_k = max(int(search_k), 1)
         self._search_log_path = search_log_path
         self._search_seed_per_candidate = bool(search_seed_per_candidate)
+
+        self._prm_reward = None
+        if prm_idm_ckpt:
+            if PRMReward is None or PRMRewardConfig is None:
+                logger.warning(
+                    "prm package not importable; falling back to heuristic reward."
+                )
+            else:
+                try:
+                    self._prm_reward = PRMReward(
+                        PRMRewardConfig(
+                            idm_ckpt_path=prm_idm_ckpt,
+                            lambda_exec=float(prm_lambda_exec),
+                            lambda_cons=float(prm_lambda_cons),
+                        )
+                    )
+                    logger.info(
+                        "PRM reward enabled: ckpt=%s exec=%.3f cons=%.3f",
+                        prm_idm_ckpt, prm_lambda_exec, prm_lambda_cons,
+                    )
+                except Exception as exc:  # pragma: no cover - runtime fallback
+                    logger.warning(
+                        "Failed to load PRM reward (%s); falling back to heuristic.", exc
+                    )
+                    self._prm_reward = None
 
         # Frame buffers for accumulation (per camera view)
         self._frame_buffers: dict[str, list[np.ndarray]] = {
@@ -162,6 +204,61 @@ class ARDroidRoboarenaPolicy:
         finally:
             if hasattr(action_head, "_offload_auxiliary_components"):
                 action_head._offload_auxiliary_components()
+
+    def _score_candidate(self, action: np.ndarray, video_pred: torch.Tensor) -> tuple[float, dict]:
+        """Score one best-of-K candidate.
+
+        If a PRM (trained IDM) is loaded, run R_exec + lambda_cons * R_cons on
+        the decoded predicted video. Otherwise use the heuristic
+        executable_action_score on the action chunk only.
+        """
+        if self._prm_reward is None:
+            return executable_action_score(action)
+
+        try:
+            frames = self._video_pred_to_idm_frames(video_pred)
+            return self._prm_reward.score(action, frames)
+        except Exception as exc:  # pragma: no cover - runtime fallback
+            logger.warning(
+                "PRM scoring failed (%s); falling back to heuristic for this candidate.", exc
+            )
+            return executable_action_score(action)
+
+    def _video_pred_to_idm_frames(self, video_pred: torch.Tensor) -> np.ndarray:
+        """Convert DreamZero predicted video latents to IDM input frames.
+
+        Returns ``(n_cams, T, 3, H, W)`` uint8 already resized to the IDM's
+        ``image_size``.
+
+        NOTE: the cam-axis layout of DreamZero's multi-cam latents differs
+        between embodiments. For LIBERO-90 the LoRA was trained on 2 cams
+        (agentview + wrist). This helper currently assumes the decoded tensor
+        shape is ``(B, C, T, H, W)`` with B == n_cams (cams batched). If your
+        LoRA stacks cams differently (channel-concat, tile-stitch, ...), adjust
+        the reshape below — and run prm.reward.PRMReward on a sanity batch
+        before trusting the K-rerank numbers.
+        """
+        from prm.reward import prepare_video_frames_for_idm
+
+        decoded = self._decode_video_latents(video_pred)
+        decoded = rearrange(decoded, "B C T H W -> B T H W C")
+        decoded = ((decoded.float() + 1) * 127.5).clamp(0, 255).to(torch.uint8).cpu().numpy()
+
+        n_cams = self._prm_reward.cfg.n_cams
+        if decoded.shape[0] < n_cams:
+            raise ValueError(
+                f"decoded video has {decoded.shape[0]} cams along batch axis; "
+                f"PRM expects {n_cams}. Inspect the multi-cam layout of your "
+                f"LoRA's video output and update _video_pred_to_idm_frames."
+            )
+        decoded = decoded[:n_cams]  # (n_cams, T, H, W, 3)
+
+        return prepare_video_frames_for_idm(
+            decoded,
+            n_cams=n_cams,
+            video_len=self._prm_reward.cfg.video_len,
+            image_size=self._prm_reward.cfg.target_image_size,
+        )
     
     def _convert_observation(self, obs: dict) -> dict:
         """Convert roboarena observation format to AR_droid format.
@@ -492,7 +589,7 @@ class ARDroidRoboarenaPolicy:
             seed = (base_seed + i) if (self._search_seed_per_candidate and k > 1) else None
             result_batch, video_pred = self._distributed_forward_once(converted_obs, seed=seed)
             action = self._extract_action_array(result_batch)
-            score, score_info = executable_action_score(action)
+            score, score_info = self._score_candidate(action, video_pred)
             candidates.append({
                 "idx": i,
                 "seed": seed,
@@ -1065,6 +1162,9 @@ def main(args: Args) -> None:
         search_k=args.search_k,
         search_log_path=args.search_log_path,
         search_seed_per_candidate=args.search_seed_per_candidate,
+        prm_idm_ckpt=args.prm_idm_ckpt,
+        prm_lambda_exec=args.prm_lambda_exec,
+        prm_lambda_cons=args.prm_lambda_cons,
     )
     
     # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)
