@@ -187,6 +187,13 @@ class EmbodimentTag(Enum):
     The Libero Sim dataset.
     """
 
+    LIBERO = "libero"
+    """
+    Matches the key used in the released DreamZero-LIBERO90-LoRA's experiment_cfg
+    (transforms.libero, embodiment_tag_mapping.libero: 33). The enum value
+    distinct from LIBERO_SIM because the LoRA config uses the bare key "libero".
+    """
+
     DROID_SIM = "droid_sim"
     """
     The Droid dataset in sim.
