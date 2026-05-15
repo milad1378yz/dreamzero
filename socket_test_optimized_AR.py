@@ -427,16 +427,36 @@ class ARDroidRoboarenaPolicy:
         Roboarena format:
             - action: (N, 8) - 7 joint positions + 1 gripper
         """
+        # LIBERO: the model emits a single concatenated `action.action`
+        # (OSC_POSE: dx, dy, dz, drx, dry, drz, gripper), not the DROID
+        # joint_position / gripper_position split. Return it directly.
+        if self._embodiment_tag == "libero":
+            act = None
+            for key, value in action_dict.items():
+                if key == "action.action" or key.endswith(".action") or "action" in key:
+                    act = value
+                    break
+            if act is None:
+                logger.error("LIBERO: no action.* key in %s", list(action_dict.keys()))
+                return np.zeros((1, 7), dtype=np.float32)
+            if isinstance(act, torch.Tensor):
+                act = act.cpu().numpy()
+            act = np.asarray(act, dtype=np.float32)
+            if act.ndim == 1:
+                act = act.reshape(1, -1)
+            # Keep only the active OSC_POSE dims (first 7 of the padded slot).
+            return act[:, :7].astype(np.float32)
+
         joint_action = None
         gripper_action = None
-        
+
         # Extract actions from dict
         for key, value in action_dict.items():
             if "joint_position" in key:
                 joint_action = value
             elif "gripper_position" in key or "gripper" in key:
                 gripper_action = value
-        
+
         if joint_action is None:
             # Fallback: return zeros
             return np.zeros((1, 8), dtype=np.float32)
