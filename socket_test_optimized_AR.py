@@ -1174,6 +1174,14 @@ def main(args: Args) -> None:
     signal_group = dist.new_group(backend="gloo", timeout=timeout_delta)
     logger.info(f"Rank {rank} initialized signal_group (gloo)")
 
+    if args.base_model_path is not None:
+        # Patch VLA.load_lora to load AgiBot weights between cls(config) and
+        # the LoRA state dict — required so sim_policy's downstream
+        # merge_and_unload() folds the LoRA on top of AgiBot rather than
+        # Wan2.1. See prm/lora_with_base.py for the full rationale.
+        from prm.lora_with_base import apply_base_model_patch
+        apply_base_model_patch(args.base_model_path)
+
     policy = GrootSimPolicy(
         embodiment_tag=EmbodimentTag(embodiment_tag),
         model_path=model_path,
@@ -1182,15 +1190,6 @@ def main(args: Args) -> None:
         quantization=args.quantization,
     )
     _apply_max_chunk_size(policy, args.max_chunk_size)
-
-    if args.base_model_path is not None:
-        # Merge AgiBot weights into the policy and re-apply the LoRA.
-        # See prm/lora_with_base.py for why this is required when running
-        # the LIBERO LoRA (the released checkpoint only contains LoRA deltas
-        # + a handful of MLPs; the action-head image encoder etc. come from
-        # AgiBot).
-        from prm.lora_with_base import merge_base_into_policy
-        merge_base_into_policy(policy, args.base_model_path, model_path)
 
     # Create server for all ranks - rank 0 handles websocket, others run worker loop
     hostname = socket.gethostname()
