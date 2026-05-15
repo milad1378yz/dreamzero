@@ -371,24 +371,43 @@ class ARDroidRoboarenaPolicy:
                 video = np.stack(frames_to_use, axis=0)
                 converted[droid_key] = video
         
-        # Convert state observations
-        if "observation/joint_position" in obs:
-            joint_pos = obs["observation/joint_position"]
-            # Reshape to (1, 7) if needed
-            if joint_pos.ndim == 1:
-                joint_pos = joint_pos.reshape(1, -1)
-            converted["state.joint_position"] = joint_pos.astype(np.float64)
-        else:
-            converted["state.joint_position"] = np.zeros((1, 7), dtype=np.float64)
-        
-        if "observation/gripper_position" in obs:
-            gripper_pos = obs["observation/gripper_position"]
-            # Reshape to (1, 1) if needed
+        # Convert state observations — embodiment-specific.
+        if self._embodiment_tag == "libero":
+            # LIBERO LoRA uses OSC_POSE state: eef_pos (3) + ee_ori (3, axis-angle)
+            # + gripper (1). The bridge packs ee_pos+ee_ori into cartesian_position.
+            cart = obs.get("observation/cartesian_position")
+            if cart is None:
+                cart = np.zeros((6,), dtype=np.float64)
+            cart = np.asarray(cart, dtype=np.float64)
+            if cart.ndim == 1:
+                cart = cart.reshape(1, -1)
+            converted["state.eef_pos"] = cart[:, :3].astype(np.float64)
+            converted["state.ee_ori"] = cart[:, 3:6].astype(np.float64)
+
+            gripper_pos = obs.get("observation/gripper_position")
+            if gripper_pos is None:
+                gripper_pos = np.zeros((1, 1), dtype=np.float64)
+            gripper_pos = np.asarray(gripper_pos, dtype=np.float64)
             if gripper_pos.ndim == 1:
                 gripper_pos = gripper_pos.reshape(1, -1)
-            converted["state.gripper_position"] = gripper_pos.astype(np.float64)
+            converted["state.gripper"] = gripper_pos.astype(np.float64)
         else:
-            converted["state.gripper_position"] = np.zeros((1, 1), dtype=np.float64)
+            # DROID embodiment: joint_position (7) + gripper_position (1).
+            if "observation/joint_position" in obs:
+                joint_pos = obs["observation/joint_position"]
+                if joint_pos.ndim == 1:
+                    joint_pos = joint_pos.reshape(1, -1)
+                converted["state.joint_position"] = joint_pos.astype(np.float64)
+            else:
+                converted["state.joint_position"] = np.zeros((1, 7), dtype=np.float64)
+
+            if "observation/gripper_position" in obs:
+                gripper_pos = obs["observation/gripper_position"]
+                if gripper_pos.ndim == 1:
+                    gripper_pos = gripper_pos.reshape(1, -1)
+                converted["state.gripper_position"] = gripper_pos.astype(np.float64)
+            else:
+                converted["state.gripper_position"] = np.zeros((1, 1), dtype=np.float64)
         
         # Convert prompt
         if "prompt" in obs:
