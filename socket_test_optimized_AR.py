@@ -1224,9 +1224,13 @@ def main(args: Args) -> None:
     )
 
     if embodiment_tag == "libero":
-        # LIBERO: agentview + wrist (2 cams), 320x176 frames per the LoRA conf.
+        # LIBERO: agentview + wrist (2 cams). The dataset metadata declares
+        # native frames at 256x256; the DreamZero transform pipeline crops
+        # and resizes them down to 176x320 internally. So the bridge must
+        # send 256x256 frames here even though the LoRA's working resolution
+        # downstream is 176x320.
         server_config = PolicyServerConfig(
-            image_resolution=(176, 320),
+            image_resolution=(256, 256),
             needs_wrist_camera=True,
             n_external_cameras=1,
             needs_stereo_camera=False,
