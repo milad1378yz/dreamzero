@@ -953,7 +953,14 @@ class WebsocketPolicyServer:
             except Exception as e:
                 logger.error(f"Worker loop error on rank {dist.get_rank()}: {e}")
                 traceback.print_exc()
-                break
+                # Keep the rank alive so a single bad inference call doesn't
+                # take down the worker — break the dist barrier dance for this
+                # call, then resume waiting for the next signal from rank 0.
+                try:
+                    dist.barrier(group=self._signal_group)
+                except Exception:
+                    pass
+                continue
 
     def _receive_batch_from_rank0(self):
         """Receive batch data from rank 0 using torch.distributed primitives."""
